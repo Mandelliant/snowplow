@@ -232,38 +232,43 @@ object EnrichmentManager {
       event.page_urlfragment = components.fragment.orNull
     }
 
-    // If our IpToGeo enrichment is enabled,
-    // get the geo-location from the IP address
-    val geoLocation = {
-      registry.getIpLookupsEnrichment match {
-        case Some(geo) => {
-          Option(event.user_ipaddress) match {
-            case Some(address) => {
-              val ipLookupResult = geo.extractIpInformation(address)
-              for (res <- ipLookupResult) {
-                for (loc <- res._1) {
-                  event.geo_country     = loc.countryCode
-                  event.geo_region      = loc.region.orNull
-                  event.geo_city        = loc.city.orNull
-                  event.geo_zipcode     = loc.postalCode.orNull
-                  event.geo_latitude    = loc.latitude
-                  event.geo_longitude   = loc.longitude
-                  event.geo_region_name = loc.regionName.orNull
-                  event.geo_timezone    = loc.timezone.orNull
-                }
-                event.ip_isp          = res._2.orNull
-                event.ip_organization = res._3.orNull
-                event.ip_domain       = res._4.orNull
-                event.ip_netspeed     = res._5.orNull
-              }
-              ipLookupResult
-            }
-            case None => unitSuccess
-          }
-        }
-        case None => unitSuccess
+    // If our IpToGeo enrichment is enabled, get the geo-location from the IP address
+    val geoLocation = (for {
+      enrichment <- registry.getIpLookupsEnrichment
+      ip         <- Option(event.user_ipaddress)
+      result = {
+        val ipLookupResult = enrichment.extractIpInformation(ip)
+        ipLookupResult.ipLocation.foreach(_.foreach { loc =>
+          event.geo_country     = loc.countryCode
+          event.geo_region      = loc.region.orNull
+          event.geo_city        = loc.city.orNull
+          event.geo_zipcode     = loc.postalCode.orNull
+          event.geo_latitude    = loc.latitude
+          event.geo_longitude   = loc.longitude
+          event.geo_region_name = loc.regionName.orNull
+          event.geo_timezone    = loc.timezone.orNull
+        })
+        ipLookupResult.isp.foreach(_.foreach { i =>
+          event.ip_isp = i
+        })
+        ipLookupResult.organization.foreach(_.foreach { org =>
+          event.ip_organization = org
+        })
+        ipLookupResult.domain.foreach(_.foreach { d =>
+          event.ip_domain = d
+        })
+        ipLookupResult.connectionType.foreach(_.foreach { ct =>
+          event.ip_netspeed = ct
+        })
+        (
+          ipLookupResult.ipLocation.getOrElse(().success[Throwable]).leftMap(_.getMessage),
+          ipLookupResult.isp.getOrElse(().success[Throwable]).leftMap(_.getMessage),
+          ipLookupResult.organization.getOrElse(().success[Throwable]).leftMap(_.getMessage),
+          ipLookupResult.domain.getOrElse(().success[Throwable]).leftMap(_.getMessage),
+          ipLookupResult.connectionType.getOrElse(().success[Throwable]).leftMap(_.getMessage)
+        )
       }
-    }
+    } yield result).getOrElse((unitSuccess, unitSuccess, unitSuccess, unitSuccess, unitSuccess))
 
     // To anonymize the IP address
     Option(event.user_ipaddress).map(ip =>
@@ -539,7 +544,7 @@ object EnrichmentManager {
     }
 
     // Collect our errors on Failure, or return our event on Success
-    // Broken into two parts due to 12 argument limit on |@|
+    // Broken into three parts due to 12 argument limit on |@|
     val first =
       (useragent.toValidationNel |@|
         collectorTstamp.toValidationNel |@|
@@ -548,12 +553,20 @@ object EnrichmentManager {
         uaParser.toValidationNel |@|
         collectorVersionSet.toValidationNel |@|
         pageUri.toValidationNel |@|
-        crossDomain.toValidationNel |@|
-        geoLocation.toValidationNel |@|
-        refererUri.toValidationNel) { (_, _, _, _, _, _, _, _, _, _) =>
+        crossDomain.toValidationNel) { (_, _, _, _, _, _, _, _) =>
         ()
       }
     val second =
+      (geoLocation._1.toValidationNel |@| // ip location
+        geoLocation._2.toValidationNel |@| // isp
+        geoLocation._3.toValidationNel |@| // org
+        geoLocation._4.toValidationNel |@| // domain
+        geoLocation._5.toValidationNel |@| // connection type
+        refererUri.toValidationNel) { (_, _, _, _, _, _) =>
+        ()
+      }
+
+    val third =
       (transform |@|
         currency |@|
         secondPassTransform |@|
@@ -571,7 +584,7 @@ object EnrichmentManager {
     //This needs to happen last
     val last = piiTransform
 
-    (first |@| second |@| last) { (_, _, _) =>
+    (first |@| second |@| third |@| last) { (_, _, _, _) =>
       event
 
     }
